@@ -17,12 +17,11 @@ from googleapiclient.http import MediaIoBaseDownload
 from googleapiclient.errors import HttpError
 
 SCOPES = ['https://www.googleapis.com/auth/drive.readonly']
-CHUNK_SIZE = 64 * 1024 * 1024  # 64 MB: bom throughput p/ arquivos grandes
+CHUNK_SIZE = 64 * 1024 * 1024  # 64 MB
 
 # ---------- Helpers ----------
 
 def rel_join(path_atual: str, nome: str) -> str:
-    """Garante path relativo (sem / ou \ no início)."""
     p = os.path.join(path_atual, nome)
     return p.lstrip("/\\")
 
@@ -38,19 +37,12 @@ def fmt_size(num_bytes):
     return f"{size:.2f} {units[i]}"
 
 def folder_pattern_from_file_pattern(padrao_arquivo: str) -> str:
-    """
-    Deriva padrão de PASTA a partir do padrão de arquivo da raiz:
-      'a*.zip' -> 'a*'
-      '*.mp4'  -> '*'
-      'data_*.*' -> 'data_*'
-    """
     base = (padrao_arquivo or "").strip()
     if '.' in base:
         return base.split('.', 1)[0] or '*'
     return base or '*'
 
 class PowerInhibitor:
-    """Mantém o computador acordado durante o download."""
     def __init__(self, enable: bool, log_fn):
         self.enable = enable
         self.log = log_fn
@@ -127,25 +119,13 @@ def extrair_id_da_pasta(texto):
         return match.group(1)
     raise ValueError("ID da pasta inválido (cole o ID ou URL da pasta do Drive).")
 
-# ---------- Listagem (filtro SOMENTE na RAIZ) ----------
+# ---------- Listagem (filtro SÓ na RAIZ) ----------
 
 def listar_raiz_e_recurse(service, raiz_id, padrao_arquivos, log_fn):
-    """
-    Regras:
-      - Na RAIZ:
-         * arquivos: aplica padrao_arquivos (ex.: a*.zip) -> coleta
-         * pastas: aplica padrao_pastas (derivado) -> se combinar, entra
-      - Dentro da(s) pasta(s) aceitas na raiz:
-         * NÃO há filtro: coleta tudo (pastas e arquivos).
-    Retorna:
-      pastas_rel: [str, ...] (TODAS as pastas a criar, inclusive as raiz aceitas)
-      arquivos_rel: [(id, relpath, size), ...]
-    """
     padrao_pastas_raiz = folder_pattern_from_file_pattern(padrao_arquivos)
     pastas_rel = []
     arquivos_rel = []
 
-    # 1) listar apenas filhos imediatos da RAIZ
     page_token = None
     while True:
         resp = service.files().list(
@@ -162,20 +142,17 @@ def listar_raiz_e_recurse(service, raiz_id, padrao_arquivos, log_fn):
             mime = item['mimeType']
 
             if mime == 'application/vnd.google-apps.folder':
-                # só entra se a PASTA DA RAIZ combinar com o padrão de pastas
                 if fnmatch.fnmatch(nome, padrao_pastas_raiz):
-                    root_folder_rel = rel_join("", nome)  # vira "NomeDaPasta"
+                    root_folder_rel = rel_join("", nome)
                     pastas_rel.append(root_folder_rel)
                     log_fn(f"📁 (raiz) selecionada: {root_folder_rel}/")
-                    # entra e coleta TUDO dentro dessa pasta (sem filtro)
                     listar_tudo_dentro(service, fid, root_folder_rel, pastas_rel, arquivos_rel, log_fn)
                 else:
                     log_fn(f"🚫 (raiz) ignorando pasta: {nome}")
             else:
-                # arquivos no nível RAIZ: aplicar padrao_arquivos
                 if fnmatch.fnmatch(nome, padrao_arquivos):
                     size_val = int(item.get('size', 0)) if item.get('size') is not None else None
-                    rel = rel_join("", nome)  # "arquivo_na_raiz.ext"
+                    rel = rel_join("", nome)
                     log_fn(f"✔️ (raiz) {rel} ({fmt_size(size_val)})")
                     arquivos_rel.append((fid, rel, size_val))
 
@@ -186,7 +163,6 @@ def listar_raiz_e_recurse(service, raiz_id, padrao_arquivos, log_fn):
     return pastas_rel, arquivos_rel
 
 def listar_tudo_dentro(service, pasta_id, base_relpath, pastas_rel, arquivos_rel, log_fn):
-    """Coleta TUDO (sem filtro) dentro de 'pasta_id', preenchendo caminhos relativos sob 'base_relpath'."""
     page_token = None
     while True:
         resp = service.files().list(
@@ -203,7 +179,7 @@ def listar_tudo_dentro(service, pasta_id, base_relpath, pastas_rel, arquivos_rel
             mime = item['mimeType']
 
             if mime == 'application/vnd.google-apps.folder':
-                new_base = rel_join(base_relpath, nome)  # mantém hierarquia: PastaRaiz/Sub/...
+                new_base = rel_join(base_relpath, nome)
                 pastas_rel.append(new_base)
                 log_fn(f"📁 {new_base}/")
                 listar_tudo_dentro(service, fid, new_base, pastas_rel, arquivos_rel, log_fn)
@@ -217,9 +193,9 @@ def listar_tudo_dentro(service, pasta_id, base_relpath, pastas_rel, arquivos_rel
         if not page_token:
             break
 
-# ---------- Download ----------
+# ---------- Download (thread worker, SEM chamadas Tk diretas) ----------
 
-def download_with_retries(request, local_path, size_val, log_fn, root, chunk_size, max_retries=5):
+def download_with_retries(request, local_path, size_val, log_fn, progress_tick_fn, chunk_size, max_retries=5):
     with io.FileIO(local_path, 'wb') as f:
         downloader = MediaIoBaseDownload(f, request, chunksize=chunk_size)
         done = False
@@ -230,7 +206,7 @@ def download_with_retries(request, local_path, size_val, log_fn, root, chunk_siz
                 status, done = downloader.next_chunk()
                 if status:
                     pct = int(status.progress() * 100)
-                    bucket = pct // 5  # log a cada 5%
+                    bucket = pct // 5
                     if bucket != last_bucket:
                         if size_val:
                             cur = int(size_val * (pct/100.0))
@@ -238,7 +214,7 @@ def download_with_retries(request, local_path, size_val, log_fn, root, chunk_siz
                         else:
                             log_fn(f"   ... {pct}%")
                         last_bucket = bucket
-                        root.update_idletasks()
+                        progress_tick_fn()  # notifica UI que há update (safe via after)
             except (HttpError, OSError) as e:
                 if retries < max_retries:
                     wait = 2 ** retries
@@ -248,8 +224,8 @@ def download_with_retries(request, local_path, size_val, log_fn, root, chunk_siz
                     continue
                 raise
 
-def baixar_arquivos(pasta_input, padrao_arquivos, destino, skip_existing, keep_awake,
-                    progress_var, progress_bar, log_fn, root):
+def worker_baixar(pasta_input, padrao_arquivos, destino, skip_existing, keep_awake,
+                  set_progress, log_fn, done_cb):
     try:
         with PowerInhibitor(keep_awake, log_fn):
             raiz_id = extrair_id_da_pasta(pasta_input)
@@ -258,86 +234,83 @@ def baixar_arquivos(pasta_input, padrao_arquivos, destino, skip_existing, keep_a
             log_fn("🔍 Listando raiz (filtro aplicado) e subpastas (sem filtro)...")
             pastas_rel, arquivos_rel = listar_raiz_e_recurse(service, raiz_id, padrao_arquivos, log_fn)
 
-            # 1) cria TODAS as pastas coletadas (mantendo hierarquia correta)
+            # criar pastas
             pastas_unicas = sorted(set(pastas_rel), key=lambda p: (p.count(os.sep), p))
             for p in pastas_unicas:
                 full_dir = os.path.join(destino, p.lstrip("/\\"))
                 os.makedirs(full_dir, exist_ok=True)
 
-            # 2) baixa arquivos conforme opção
             total = len(arquivos_rel)
             if total == 0:
-                log_fn("⚠️ Nenhum arquivo para baixar com esse filtro na raiz.")
-                messagebox.showinfo("Aviso", "Nenhum arquivo para baixar com esse filtro na raiz.")
+                done_cb(False, "Nenhum arquivo para baixar com esse filtro na raiz.")
                 return
 
             info_opcao = "pulando existentes" if skip_existing else "sobrescrevendo existentes"
             log_fn(f"🎯 Total: {total} arquivos ({info_opcao})")
-            progress_var.set(0)
-            progress_bar['maximum'] = total
+            set_progress(0, total)
 
             for i, (file_id, relpath, size_val) in enumerate(arquivos_rel, start=1):
                 relpath = relpath.lstrip("/\\")
                 local_path = os.path.join(destino, relpath)
 
-                # pular se existir e (opcionalmente) mesmo tamanho
+                # pular se existir e tamanho igual
                 if os.path.exists(local_path) and skip_existing:
                     if size_val and os.path.getsize(local_path) == size_val:
                         log_fn(f"⏭️ Pulando (já existe e mesmo tamanho): {relpath}")
-                        progress_var.set(i); root.update_idletasks()
+                        set_progress(i, total)
                         continue
                     else:
                         log_fn(f"🔁 Existe com tamanho diferente — será rebaixado: {relpath}")
 
                 os.makedirs(os.path.dirname(local_path), exist_ok=True)
 
-                # espaço livre (se souber tamanho)
+                # checa espaço
                 dest_dir = os.path.dirname(local_path) or destino
                 free = shutil.disk_usage(dest_dir).free
                 if size_val and free < size_val + 200*1024*1024:
                     log_fn(f"🛑 Sem espaço p/ {relpath} (precisa ~{fmt_size(size_val)}, livre {fmt_size(free)})")
-                    progress_var.set(i); root.update_idletasks()
+                    set_progress(i, total)
                     continue
 
                 log_fn(f"⬇️ Baixando: {relpath} ({fmt_size(size_val)})")
+
                 request = service.files().get_media(fileId=file_id)
-                download_with_retries(request, local_path, size_val, log_fn, root, CHUNK_SIZE)
+                download_with_retries(
+                    request, local_path, size_val, log_fn,
+                    progress_tick_fn=lambda: set_progress(i-1, total),  # só para animar um tico durante o arquivo
+                    chunk_size=CHUNK_SIZE
+                )
 
-                progress_var.set(i)
-                root.update_idletasks()
+                set_progress(i, total)
 
-            log_fn("✅ Processamento finalizado!")
-            messagebox.showinfo("Concluído", f"{total} arquivos processados ({info_opcao}).")
+            done_cb(True, f"{total} arquivos processados ({info_opcao}).")
     except Exception as e:
-        log_fn(f"❌ Erro: {str(e)}")
-        messagebox.showerror("Erro", str(e))
+        done_cb(False, f"Erro: {str(e)}")
 
-# ---------- GUI ----------
+# ---------- GUI (toda interação Tk SÓ aqui, via root.after) ----------
 
 def criar_interface():
     root = tk.Tk()
     root.title("Google Drive Downloader (filtro na RAIZ)")
-    root.geometry("820x680")
+    root.geometry("840x700")
 
     tk.Label(root, text="ID/URL da Pasta no Drive:").pack()
-    pasta_entry = tk.Entry(root, width=110)
+    pasta_entry = tk.Entry(root, width=115)
     pasta_entry.pack()
 
     tk.Label(root, text="Filtro (aplicado SOMENTE na raiz, ex: a*.zip):").pack()
-    filtro_entry = tk.Entry(root, width=110)
+    filtro_entry = tk.Entry(root, width=115)
     filtro_entry.insert(0, "a*.zip")
     filtro_entry.pack()
 
-    # pular existentes (padrão)
     skip_existing_var = tk.BooleanVar(value=True)
     tk.Checkbutton(root, text="Não baixar arquivo já existente (padrão)", variable=skip_existing_var).pack(pady=4)
 
-    # manter PC acordado (padrão)
     keep_awake_var = tk.BooleanVar(value=True)
     tk.Checkbutton(root, text="Manter PC acordado durante o download (padrão)", variable=keep_awake_var).pack(pady=4)
 
     tk.Label(root, text="Destino local:").pack()
-    destino_entry = tk.Entry(root, width=110)
+    destino_entry = tk.Entry(root, width=115)
     destino_entry.pack()
 
     def escolher_destino():
@@ -360,9 +333,32 @@ def criar_interface():
     log_box.config(yscrollcommand=scrollbar.set)
     scrollbar.config(command=log_box.yview)
 
-    def log(msg):
+    def ui_log(msg):
         log_box.insert(tk.END, msg + "\n")
         log_box.see(tk.END)
+
+    def log(msg):
+        root.after(0, ui_log, msg)
+
+    def set_progress(cur, total):
+        def _set():
+            progress_bar['maximum'] = max(total, 1)
+            progress_var.set(cur)
+        root.after(0, _set)
+
+    # botão principal (guardamos referência pra habilitar/desabilitar)
+    btn = tk.Button(root, text="Baixar")
+    btn.pack(pady=10)
+
+    def done_cb(ok, msg):
+        def _done():
+            # reabilita botão e mostra mensagem na MAIN THREAD
+            btn.config(state=tk.NORMAL)
+            if ok:
+                messagebox.showinfo("Concluído", msg)
+            else:
+                messagebox.showwarning("Aviso", msg)
+        root.after(0, _done)
 
     def iniciar_thread_download():
         pasta = pasta_entry.get().strip()
@@ -376,14 +372,18 @@ def criar_interface():
             messagebox.showwarning("Aviso", "Preencha todos os campos.")
             return
 
+        # desabilita botão enquanto roda
+        btn.config(state=tk.DISABLED)
+
         Thread(
-            target=baixar_arquivos,
+            target=worker_baixar,
             args=(pasta, padrao_arquivos, destino, skip_existing, keep_awake,
-                  progress_var, progress_bar, log, root),
+                  set_progress, log, done_cb),
             daemon=True
         ).start()
 
-    tk.Button(root, text="Baixar", command=iniciar_thread_download).pack(pady=10)
+    btn.config(command=iniciar_thread_download)
+
     root.mainloop()
 
 if __name__ == "__main__":
